@@ -66,6 +66,7 @@ async function handleScheduled(event,env) {
         ⏰ 剩余时间:  ${daysRemaining}天（到期时间：${domain.expirationDate}）
         🏷️ 注册服务商:  ${escapeMD(domain.system)}
         🔗 注册地址:  ${domain.systemURL}
+        ☑  续期面板：https://domain.yhpp.pp.ua/
           `;
           
 
