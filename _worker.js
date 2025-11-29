@@ -1,20 +1,32 @@
-// 定义外部变量
+// ==================== 配置区域 ====================
+// 默认配置变量
 let sitename = "续期管家"; //变量名SITENAME，自定义站点名称，默认为"续期管家"
 let domains = ""; //KV空间创建SECRET_KV后，新增一组kv对，填入域名信息json格式，必须设置的变量
 let tgid = ""; //变量名TGID，填入TG机器人ID，不需要提醒则不填
 let tgtoken = ""; //变量名TGTOKEN，填入TG的TOKEN，不需要提醒则不填
-let days = 7; //变量名DAYS，提前几天发送TG提醒，默认为7天，必须为大于0的整数
+let wxPushToken = ""; //变量名WX_PUSH_TOKEN，填入微信推送TOKEN，不需要提醒则不填
+let days = 7; //变量名DAYS，提前几天发送提醒，默认为7天，必须为大于0的整数
 
 // 背景图片API配置
 const bgImageAPIs = {
   bing: 'https://bing.img.run/1920x1080.php',
   unsplash: 'https://source.unsplash.com/random/1920x1080',
   picsum: 'https://picsum.photos/1920/1080',
-  // 添加备用API
   bingFallback: 'https://api.dujin.org/bing/1920.php'
 };
 
-//发送消息方法，默认只支持TG
+// 推送API配置
+const pushAPIs = {
+  wx: 'https://push.corex.ggff.net/wxsend'
+};
+
+// ==================== 推送功能区域 ====================
+/**
+ * 发送Telegram消息
+ * @param {string} message - 消息内容
+ * @param {string} tgid - Telegram聊天ID
+ * @param {string} tgtoken - Telegram Bot Token
+ */
 async function sendtgMessage(message, tgid, tgtoken) {
   if (!tgid || !tgtoken) return;
   const url = `https://api.telegram.org/bot${tgtoken}/sendMessage`;
@@ -33,33 +45,85 @@ async function sendtgMessage(message, tgid, tgtoken) {
   }
 }
 
-//定时检查域名到期时间并发送消息
-async function handleScheduled(event,env) {
+/**
+ * 发送微信推送消息
+ * @param {string} title - 消息标题
+ * @param {string} content - 消息内容
+ * @param {string} token - 微信推送Token
+ */
+async function sendWxMessage(title, content, token) {
+  if (!token) return;
+  try {
+    await fetch(pushAPIs.wx, {
+      method: 'POST',
+      headers: {
+        'Authorization': token,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        title: title,
+        content: content
+      }),
+    });
+  } catch (error) {
+    console.error('微信推送失败:', error);
+  }
+}
+
+/**
+ * 统一推送接口，同时发送TG和微信推送
+ * @param {string} title - 消息标题
+ * @param {string} message - 消息内容（TG格式，带Markdown）
+ * @param {string} plainMessage - 纯文本消息（微信推送用）
+ * @param {object} config - 推送配置 {tgid, tgtoken, wxPushToken}
+ */
+async function sendNotifications(title, message, plainMessage, config) {
+  const { tgid, tgtoken, wxPushToken } = config;
   
+  // 并行发送推送，提高效率
+  await Promise.all([
+    sendtgMessage(message, tgid, tgtoken),
+    sendWxMessage(title, plainMessage || message, wxPushToken)
+  ]);
+}
+
+// ==================== 定时任务区域 ====================
+/**
+ * 定时检查域名到期时间并发送消息
+ * @param {object} event - 定时事件
+ * @param {object} env - 环境变量
+ */
+async function handleScheduled(event, env) {
+  // 从环境变量获取配置
   tgid = env.TGID || tgid;
   tgtoken = env.TGTOKEN || tgtoken;
+  wxPushToken = env.WX_PUSH_TOKEN || wxPushToken;
   days = Number(env.DAYS || days);
 
+  // 获取域名列表
   try {
     const domainsKV = await env.SECRET_KV.get('domains');
     domains = domainsKV ? JSON.parse(domainsKV) : [];
     if (!Array.isArray(domains)) throw new Error('JSON 数据格式不正确');
   } catch (error) {
-    return  await sendtgMessage("从Cloudflare KV中获取的 JSON 数据格式不正确", tgid, tgtoken); 
+    const errorMsg = "从Cloudflare KV中获取的 JSON 数据格式不正确";
+    await sendNotifications("域名监控错误", errorMsg, errorMsg, {
+      tgid, tgtoken, wxPushToken
+    });
+    return;
   }
 
   try {
-       
     const today = new Date().toISOString().split('T')[0]; // 当前日期字符串
+    const escapeMD = (str) => str.replace(/([_*\[\]()~`>#+\-=|{}.!])/g, '\\$1');
 
     for (const domain of domains) {
       const expirationDate = new Date(domain.expirationDate);
-      // @ts-ignore
       const daysRemaining = Math.ceil((expirationDate - new Date()) / (1000 * 60 * 60 * 24));
 
       if (daysRemaining > 0 && daysRemaining <= days) {
-        const escapeMD = (str) => str.replace(/([_*\[\]()~`>#+\-=|{}.!])/g, '\\$1');
-        const message = `
+        // 生成TG格式消息（带Markdown转义）
+        const tgMessage = `
         【域名过期提醒】
         
         ⚠️ 域名:  ${escapeMD(domain.domain)}
@@ -68,24 +132,43 @@ async function handleScheduled(event,env) {
         🔗 注册地址:  ${domain.systemURL}
         ☑  续期面板：https://domain.yhpp.pp.ua/
           `;
-          
-
-        const lastSentDate = await env.DOMAINS_TG_KV.get(domain.domain); // 以域名为键获取上次发送时间
         
-        if (lastSentDate !== today) { // 检查是否已经在今天发送过
-          await sendtgMessage(message, tgid, tgtoken); // 发送通知
-          await env.DOMAINS_TG_KV.put(domain.domain, today); // 更新发送日期
+        // 生成纯文本消息（用于微信推送）
+        const plainMessage = `【域名过期提醒】
+
+⚠️ 域名: ${domain.domain}
+⏰ 剩余时间: ${daysRemaining}天（到期时间：${domain.expirationDate}）
+🏷️ 注册服务商: ${domain.system}
+🔗 注册地址: ${domain.systemURL}
+☑ 续期面板：https://domain.yhpp.pp.ua/`;
+
+        const lastSentDate = await env.DOMAINS_TG_KV.get(domain.domain);
+        
+        if (lastSentDate !== today) {
+          // 使用统一推送接口发送通知
+          await sendNotifications(
+            "域名过期提醒",
+            tgMessage,
+            plainMessage,
+            { tgid, tgtoken, wxPushToken }
+          );
+          await env.DOMAINS_TG_KV.put(domain.domain, today);
         }
       }
     }
 
     console.log("域名检查完成");
   } catch (error) {
-    console.error("Fetch error:", error);
+    console.error("域名检查错误:", error);
   }
 }
 
-// 保存域名信息
+// ==================== KV存储操作区域 ====================
+/**
+ * 保存域名信息到KV
+ * @param {object} env - 环境变量
+ * @param {object} domainInfo - 域名信息对象
+ */
 async function saveDomainToKV(env, domainInfo) {
   const domainsKV = env.SECRET_KV;
   const domains = await domainsKV.get('domains') || '[]';
@@ -95,7 +178,11 @@ async function saveDomainToKV(env, domainInfo) {
   await domainsKV.put('domains', JSON.stringify(domainsArray));
 }
 
-// 删除域名信息
+/**
+ * 从KV删除域名信息
+ * @param {object} env - 环境变量
+ * @param {string} domainName - 要删除的域名
+ */
 async function deleteDomainFromKV(env, domainName) {
   const domainsKV = env.SECRET_KV;
   const domains = await domainsKV.get('domains') || '[]';
@@ -105,7 +192,11 @@ async function deleteDomainFromKV(env, domainName) {
   await domainsKV.put('domains', JSON.stringify(updatedDomainsArray));
 }
 
-// 编辑域名信息
+/**
+ * 编辑KV中的域名信息
+ * @param {object} env - 环境变量
+ * @param {object} updatedDomainInfo - 更新后的域名信息对象
+ */
 async function editDomainInKV(env, updatedDomainInfo) {
   const domainsKV = env.SECRET_KV;
   const domains = await domainsKV.get('domains') || '[]';
@@ -120,7 +211,11 @@ async function editDomainInKV(env, updatedDomainInfo) {
   }
 }
 
-// 生成密码验证页面
+// ==================== 页面生成区域 ====================
+/**
+ * 生成密码验证页面
+ * @returns {string} HTML页面内容
+ */
 async function generatePasswordPage() {
   const siteIcon = 'https://pan.811520.xyz/icon/domain.png';
   const bgimgURL = 'https://www.dmoe.cc/random.php'; // 使用必应每日图片
@@ -225,7 +320,12 @@ async function generatePasswordPage() {
   `;
 }
 
-// 生成域名列表页面
+/**
+ * 生成域名列表页面
+ * @param {Array} domains - 域名数组
+ * @param {string} SITENAME - 站点名称
+ * @returns {string} HTML页面内容
+ */
 async function generateDomainListPage(domains, SITENAME) {
   const siteIcon = 'https://pan.811520.xyz/icon/domain.png';
   const bgimgURL = bgImageAPIs.bing; // 使用必应每日图片
@@ -1068,8 +1168,14 @@ async function generateDomainListPage(domains, SITENAME) {
   `;
 }
 
-// 修改 fetch 函数来使用新的页面生成函数
+// ==================== 主程序入口 ====================
 export default {
+  /**
+   * 处理HTTP请求
+   * @param {Request} request - 请求对象
+   * @param {object} env - 环境变量
+   * @returns {Response} 响应对象
+   */
   async fetch(request, env) {
     const url = new URL(request.url);
     
@@ -1173,6 +1279,7 @@ export default {
     sitename = env.SITENAME || sitename;
     tgid = env.TGID || tgid;
     tgtoken = env.TGTOKEN || tgtoken;
+    wxPushToken = env.WX_PUSH_TOKEN || wxPushToken;
     days = Number(env.DAYS || days);
 
     // 检查 SECRET_KV 是否定义
@@ -1217,9 +1324,14 @@ export default {
     }
   },
 
-  //定时任务，监控域名到期实际发送消息
+  /**
+   * 定时任务，监控域名到期并发送消息
+   * @param {ScheduledEvent} event - 定时事件
+   * @param {object} env - 环境变量
+   * @param {ExecutionContext} ctx - 执行上下文
+   */
   async scheduled(event, env, ctx) {
-        ctx.waitUntil(handleScheduled(event,env));
-      }
+    ctx.waitUntil(handleScheduled(event, env));
+  }
 
 };
